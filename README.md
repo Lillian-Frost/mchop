@@ -3,7 +3,10 @@ App to help you decide what to cook using the ingredients you input. The suggest
 
 
 ## Running locally
-[You'll need uvicorn & npm to run this app]
+### Requirments
+- uvicorn
+- npm
+
 To run the backend, cd into `/backend` and run `uvicorn app:app --reload --port 8000`
 
 To run the frontend, cd into `/frontend` and run 
