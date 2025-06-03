@@ -1,0 +1,4 @@
+npm create vite@latest frontend -- --template react-ts
+cd frontend
+npm install
+npm run dev  # Starts on http://localhost:5173 or 3000
