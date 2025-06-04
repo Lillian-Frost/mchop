@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""
+MCP Recipe Server - Provides recipe suggestions based on available ingredients
+"""
+
+import asyncio
+import json
+import logging
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, asdict
+from difflib import SequenceMatcher
+import re
+
+from mcp.server import Server
+from mcp.server.models import InitializationOptions
+from mcp.server.stdio import stdio_server
+from mcp.types import (
+    Resource,
+    Tool,
+    TextContent,
+    ImageContent,
+    EmbeddedResource,
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("recipe-server")
+
+@dataclass
+class Recipe:
+    id: str
+    name: str
+    description: str
+    cook_time: int
+    servings: int
+    ingredients: List[str]
+    instructions: List[str]
+    cuisine: str = "general"
+    difficulty: str = "easy"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+@dataclass
+class RecipeMatch:
+    recipe: Recipe
+    match_score: float
+    available_ingredients: List[str]
+    missing_ingredients: List[str]
+    substitutions: Dict[str, List[str]]
+
+class IngredientMatcher:
+    """Handles fuzzy matching and substitution logic for ingredients"""
+    
+    def __init__(self):
+        # Common ingredient substitutions
+        self.substitutions = {
+            "butter": ["margarine", "coconut oil", "olive oil"],
+            "milk": ["almond milk", "soy milk", "oat milk", "coconut milk"],
+            "sugar": ["honey", "maple syrup", "stevia", "brown sugar"],
+            "flour": ["almond flour", "coconut flour", "oat flour"],
+            "eggs": ["flax eggs", "chia eggs", "applesauce", "banana"],
+            "chicken broth": ["vegetable broth", "beef broth", "bouillon cube + water"],
+            "heavy cream": ["milk + butter", "coconut cream", "cashew cream"],
+            "sour cream": ["greek yogurt", "coconut cream", "cashew cream"],
+            "parmesan cheese": ["nutritional yeast", "pecorino romano", "asiago"],
+            "bread crumbs": ["crushed crackers", "oats", "panko"],
+            "tomato paste": ["tomato sauce", "crushed tomatoes", "ketchup"],
+            "garlic": ["garlic powder", "shallots", "onion powder"],
+            "onion": ["shallots", "leeks", "onion powder"],
+            "lemon juice": ["lime juice", "vinegar", "white wine"],
+            "red wine": ["grape juice", "beef broth", "balsamic vinegar"]
+        }
+        
+        # Ingredient aliases and variations
+        self.aliases = {
+            "ground beef": ["beef mince", "hamburger", "minced beef"],
+            "green onions": ["scallions", "spring onions", "green onion"],
+            "bell pepper": ["capsicum", "sweet pepper"],
+            "cilantro": ["coriander", "chinese parsley"],
+            "eggplant": ["aubergine"],
+            "zucchini": ["courgette"],
+            "shrimp": ["prawns"],
+            "lima beans": ["butter beans"],
+            "chickpeas": ["garbanzo beans"],
+        }
+    
+    def normalize_ingredient(self, ingredient: str) -> str:
+        """Normalize ingredient name for better matching"""
+        # Remove quantities, cooking methods, and common modifiers
+        ingredient = re.sub(r'\d+.*?(cups?|tbsp|tsp|oz|lbs?|pounds?|grams?|kg)', '', ingredient, flags=re.IGNORECASE)
+        ingredient = re.sub(r'\b(fresh|dried|ground|chopped|diced|sliced|minced|whole|organic|raw)\b', '', ingredient, flags=re.IGNORECASE)
+        ingredient = re.sub(r'\s+', ' ', ingredient).strip().lower()
+        return ingredient
+    
+    def similarity_score(self, a: str, b: str) -> float:
+        """Calculate similarity between two ingredient names"""
+        return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+    
+    def find_ingredient_match(self, user_ingredient: str, recipe_ingredients: List[str]) -> Optional[str]:
+        """Find the best matching ingredient from recipe ingredients"""
+        normalized_user = self.normalize_ingredient(user_ingredient)
+        best_match = None
+        best_score = 0.0
+        
+        for recipe_ingredient in recipe_ingredients:
+            normalized_recipe = self.normalize_ingredient(recipe_ingredient)
+            
+            # Direct substring match
+            if normalized_user in normalized_recipe or normalized_recipe in normalized_user:
+                return recipe_ingredient
+            
+            # Fuzzy similarity match
+            score = self.similarity_score(normalized_user, normalized_recipe)
+            if score > best_score and score > 0.6:  # Threshold for fuzzy matching
+                best_score = score
+                best_match = recipe_ingredient
+        
+        return best_match
+    
+    def get_substitutions(self, missing_ingredient: str) -> List[str]:
+        """Get possible substitutions for a missing ingredient"""
+        normalized = self.normalize_ingredient(missing_ingredient)
+        
+        # Direct lookup
+        if normalized in self.substitutions:
+            return self.substitutions[normalized]
+        
+        # Check aliases
+        for base_ingredient, aliases in self.aliases.items():
+            if normalized in aliases or any(alias in normalized for alias in aliases):
+                return self.substitutions.get(base_ingredient, [])
+        
+        # Fuzzy lookup for substitutions
+        for sub_ingredient, alternatives in self.substitutions.items():
+            if self.similarity_score(normalized, sub_ingredient) > 0.8:
+                return alternatives
+        
+        return []
+
+class RecipeDatabase:
+    """Mock recipe database - in production this would connect to a real API or database"""
+    
+    def __init__(self):
+        self.recipes = [
+            Recipe(
+                id="1",
+                name="Classic Spaghetti Aglio e Olio",
+                description="Simple Italian pasta with garlic, olive oil, and red pepper flakes",
+                cook_time=15,
+                servings=2,
+                ingredients=[
+                    "400g spaghetti",
+                    "6 cloves garlic",
+                    "1/2 cup olive oil",
+                    "1/2 tsp red pepper flakes",
+                    "1/2 cup parmesan cheese",
+                    "2 tbsp fresh parsley",
+                    "salt and pepper to taste"
+                ],
+                instructions=[
+                    "Bring a large pot of salted water to boil and cook spaghetti according to package directions",
+                    "While pasta cooks, heat olive oil in a large pan over medium heat",
+                    "Add sliced garlic and red pepper flakes, cook until garlic is golden (2-3 minutes)",
+                    "Drain pasta, reserving 1 cup pasta water",
+                    "Add pasta to the pan with garlic oil, toss with pasta water as needed",
+                    "Remove from heat, add parmesan and parsley, toss and serve immediately"
+                ],
+                cuisine="Italian"
+            ),
+            Recipe(
+                id="2",
+                name="Garlic Butter Rice Pilaf",
+                description="Fragrant rice cooked with garlic, butter, and herbs",
+                cook_time=25,
+                servings=4,
+                ingredients=[
+                    "1 1/2 cups long grain rice",
+                    "3 tbsp butter",
+                    "4 cloves garlic",
+                    "3 cups chicken broth",
+                    "1/4 cup fresh parsley",
+                    "salt and pepper to taste"
+                ],
+                instructions=[
+                    "Melt butter in a large saucepan over medium heat",
+                    "Add minced garlic and cook for 1 minute until fragrant",
+                    "Add rice and stir to coat with butter, toast for 2-3 minutes",
+                    "Add chicken broth, bring to a boil",
+                    "Reduce heat to low, cover and simmer for 18-20 minutes",
+                    "Let stand 5 minutes, fluff with fork and stir in parsley"
+                ]
+            ),
+            Recipe(
+                id="3",
+                name="Quick Chicken Stir-Fry",
+                description="Healthy and fast chicken stir-fry with vegetables",
+                cook_time=20,
+                servings=3,
+                ingredients=[
+                    "1 lb chicken breast",
+                    "2 tbsp vegetable oil",
+                    "1 bell pepper",
+                    "1 onion",
+                    "2 cloves garlic",
+                    "2 tbsp soy sauce",
+                    "1 tbsp cornstarch",
+                    "1 tsp ginger",
+                    "green onions for garnish"
+                ],
+                instructions=[
+                    "Cut chicken into bite-sized pieces and season with salt and pepper",
+                    "Heat oil in a large wok or skillet over high heat",
+                    "Add chicken and cook until golden brown, about 5-7 minutes",
+                    "Add garlic and ginger, stir-fry for 30 seconds",
+                    "Add bell pepper and onion, stir-fry for 3-4 minutes",
+                    "Mix soy sauce with cornstarch, add to pan and toss until thickened",
+                    "Garnish with green onions and serve over rice"
+                ],
+                cuisine="Asian"
+            ),
+            Recipe(
+                id="4",
+                name="Creamy Mushroom Risotto",
+                description="Rich and creamy Italian rice dish with mushrooms",
+                cook_time=35,
+                servings=4,
+                ingredients=[
+                    "1 1/2 cups arborio rice",
+                    "1 lb mixed mushrooms",
+                    "6 cups warm chicken broth",
+                    "1/2 cup white wine",
+                    "1 onion",
+                    "3 cloves garlic",
+                    "1/2 cup parmesan cheese",
+                    "3 tbsp butter",
+                    "2 tbsp olive oil",
+                    "fresh thyme"
+                ],
+                instructions=[
+                    "Heat olive oil and 1 tbsp butter in a large pan, sauté mushrooms until golden",
+                    "In a separate large pan, sauté diced onion and garlic in remaining butter",
+                    "Add rice and toast for 2 minutes, stirring constantly",
+                    "Add wine and stir until absorbed",
+                    "Add warm broth one ladle at a time, stirring constantly until absorbed",
+                    "Continue until rice is creamy and tender, about 18-20 minutes",
+                    "Stir in mushrooms, parmesan, and thyme before serving"
+                ],
+                cuisine="Italian",
+                difficulty="medium"
+            )
+        ]
+    
+    def get_all_recipes(self) -> List[Recipe]:
+        return self.recipes
+    
+    def get_recipe_by_id(self, recipe_id: str) -> Optional[Recipe]:
+        return next((r for r in self.recipes if r.id == recipe_id), None)
+
+class RecipeService:
+    """Main service for recipe operations"""
+    
+    def __init__(self):
+        self.db = RecipeDatabase()
+        self.matcher = IngredientMatcher()
+    
+    def find_recipes(self, user_ingredients: List[str], min_match_score: float = 0.3) -> List[RecipeMatch]:
+        """Find recipes based on available ingredients"""
+        recipes = self.db.get_all_recipes()
+        matches = []
+        
+        for recipe in recipes:
+            available_ingredients = []
+            missing_ingredients = []
+            
+            # Check each recipe ingredient against user ingredients
+            for recipe_ingredient in recipe.ingredients:
+                matched = False
+                for user_ingredient in user_ingredients:
+                    if self.matcher.find_ingredient_match(user_ingredient, [recipe_ingredient]):
+                        available_ingredients.append(recipe_ingredient)
+                        matched = True
+                        break
+                
+                if not matched:
+                    missing_ingredients.append(recipe_ingredient)
+            
+            # Calculate match score
+            match_score = len(available_ingredients) / len(recipe.ingredients) if recipe.ingredients else 0
+            
+            if match_score >= min_match_score:
+                # Get substitutions for missing ingredients
+                substitutions = {}
+                for missing in missing_ingredients:
+                    subs = self.matcher.get_substitutions(missing)
+                    if subs:
+                        substitutions[missing] = subs
+                
+                matches.append(RecipeMatch(
+                    recipe=recipe,
+                    match_score=match_score,
+                    available_ingredients=available_ingredients,
+                    missing_ingredients=missing_ingredients,
+                    substitutions=substitutions
+                ))
+        
+        # Sort by match score (descending)
+        matches.sort(key=lambda x: x.match_score, reverse=True)
+        return matches
+
+# Initialize the MCP server
+server = Server("recipe-server")
+recipe_service = RecipeService()
+
+@server.list_tools()
+async def handle_list_tools() -> List[Tool]:
+    """List available tools"""
+    return [
+        Tool(
+            name="find_recipes",
+            description="Find recipes based on available ingredients",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ingredients": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of available ingredients"
+                    },
+                    "min_match_score": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "default": 0.3,
+                        "description": "Minimum match score for recipes (0-1)"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 10,
+                        "description": "Maximum number of recipes to return"
+                    }
+                },
+                "required": ["ingredients"]
+            }
+        ),
+        Tool(
+            name="get_recipe_details",
+            description="Get detailed information about a specific recipe",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "recipe_id": {
+                        "type": "string",
+                        "description": "ID of the recipe to get details for"
+                    }
+                },
+                "required": ["recipe_id"]
+            }
+        ),
+        Tool(
+            name="suggest_substitutions",
+            description="Get substitution suggestions for specific ingredients",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ingredients": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of ingredients to find substitutions for"
+                    }
+                },
+                "required": ["ingredients"]
+            }
+        )
+    ]
+
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+    """Handle tool calls"""
+    
+    if name == "find_recipes":
+        ingredients = arguments.get("ingredients", [])
+        min_match_score = arguments.get("min_match_score", 0.3)
+        max_results = arguments.get("max_results", 10)
+        
+        if not ingredients:
+            return [TextContent(type="text", text="Please provide at least one ingredient.")]
+        
+        matches = recipe_service.find_recipes(ingredients, min_match_score)
+        matches = matches[:max_results]  # Limit results
+        
+        if not matches:
+            return [TextContent(
+                type="text", 
+                text=f"No recipes found with the given ingredients: {', '.join(ingredients)}. Try lowering the minimum match score or adding more common ingredients."
+            )]
+        
+        # Format results
+        result = {
+            "total_found": len(matches),
+            "recipes": []
+        }
+        
+        for match in matches:
+            recipe_data = match.recipe.to_dict()
+            recipe_data.update({
+                "match_score": round(match.match_score * 100, 1),  # Convert to percentage
+                "available_ingredients": match.available_ingredients,
+                "missing_ingredients": match.missing_ingredients,
+                "substitutions": match.substitutions
+            })
+            result["recipes"].append(recipe_data)
+        
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+    
+    elif name == "get_recipe_details":
+        recipe_id = arguments.get("recipe_id")
+        recipe = recipe_service.db.get_recipe_by_id(recipe_id)
+        
+        if not recipe:
+            return [TextContent(type="text", text=f"Recipe with ID '{recipe_id}' not found.")]
+        
+        return [TextContent(type="text", text=json.dumps(recipe.to_dict(), indent=2))]
+    
+    elif name == "suggest_substitutions":
+        ingredients = arguments.get("ingredients", [])
+        
+        if not ingredients:
+            return [TextContent(type="text", text="Please provide at least one ingredient.")]
+        
+        substitutions = {}
+        for ingredient in ingredients:
+            subs = recipe_service.matcher.get_substitutions(ingredient)
+            if subs:
+                substitutions[ingredient] = subs
+        
+        if not substitutions:
+            return [TextContent(
+                type="text",
+                text=f"No substitutions found for: {', '.join(ingredients)}"
+            )]
+        
+        return [TextContent(type="text", text=json.dumps(substitutions, indent=2))]
+    
+    else:
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+async def main():
+    """Run the server"""
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="recipe-server",
+                server_version="1.0.0",
+                capabilities=server.get_capabilities(
+                    notification_options=None,
+                    experimental_capabilities=None,
+                ),
+            ),
+        )
+
+if __name__ == "__main__":
+    asyncio.run(main())
